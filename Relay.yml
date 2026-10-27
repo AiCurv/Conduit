@@ -1,0 +1,169 @@
+name: FSL Relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      ddl_url:
+        required: true
+        type: string
+      output_filename:
+        required: false
+        default: "relay-output.mkv"
+        type: string
+      upload_mode:
+        required: false
+        default: "account"
+        type: choice
+        options:
+          - account
+          - anonymous
+      callback_job_token:
+        required: false
+        type: string
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Download DDL
+        env:
+          DDL_URL: ${{ inputs.ddl_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="$RUNNER_TEMP/relay-output.bin"
+          echo "Start: $(date -u '+%F %T UTC')"
+          curl -fL -sS --retry 2 --retry-delay 3 \
+            --connect-timeout 30 --max-time 3600 \
+            -o "$FILE" "$DDL_URL"
+          echo "Downloaded: $(stat -c %s "$FILE") bytes"
+
+      - name: Upload to fsl
+        id: upload
+        env:
+          FF_ACCOUNT_ID: ${{ secrets.FF_ACCOUNT_ID }}
+          MODE: ${{ inputs.upload_mode }}
+          NAME: ${{ inputs.output_filename }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="$RUNNER_TEMP/relay-output.bin"
+          RESPONSE="$RUNNER_TEMP/upload-response.json"
+          ENCODED_NAME=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$NAME")
+
+          if [[ "$MODE" == "account" && -z "${FF_ACCOUNT_ID:-}" ]]; then
+            echo "::warning::FF_ACCOUNT_ID missing — falling back to anonymous"
+            MODE=anonymous
+          fi
+
+          if [[ "$MODE" == "account" ]]; then
+            FS_JSON="$RUNNER_TEMP/fs.json"
+            curl -sS -o "$FS_JSON" -H "Authorization: Bearer $FF_ACCOUNT_ID" \
+              "https://fuckingfast.net/api/fs"
+            ROOT_ID=$(python3 - "$FS_JSON" <<'PY'
+          import json,sys
+          try: d=json.load(open(sys.argv[1]))
+          except Exception: print(""); raise SystemExit
+          for p in (("id",),("data","id"),("root","id")):
+              cur=d; ok=True
+              for k in p:
+                  if isinstance(cur,dict) and k in cur: cur=cur[k]
+                  else: ok=False; break
+              if ok and isinstance(cur,str) and cur: print(cur); raise SystemExit
+          items=d.get("data") if isinstance(d.get("data"),list) else d.get("files")
+          if isinstance(items,list) and items: print(items[0].get("parentId","")); raise SystemExit
+          print("")
+          PY
+            )
+            if [[ -n "$ROOT_ID" ]]; then
+              URL="https://w.fuckingfast.net/$ROOT_ID/$ENCODED_NAME"
+            else
+              echo "::warning::No root dir id — trying authenticated no-parent upload"
+              URL="https://w.fuckingfast.net/$ENCODED_NAME"
+            fi
+            CODE=$(curl -sS -H "Authorization: Bearer $FF_ACCOUNT_ID" \
+              -T "$FILE" -o "$RESPONSE" -w '%{http_code}' "$URL")
+          else
+            CODE=$(curl -sS -T "$FILE" -o "$RESPONSE" -w '%{http_code}' \
+              "https://w.fuckingfast.net/$ENCODED_NAME")
+          fi
+
+          echo "HTTP $CODE"
+          cat "$RESPONSE"; echo
+          if [[ "$CODE" != "200" && "$CODE" != "201" ]]; then
+            echo "::error::Upload failed: $CODE"; exit 1
+          fi
+
+          PARSED=$(python3 - "$RESPONSE" <<'PY'
+          import json,sys
+          d=json.load(open(sys.argv[1]))["data"]
+          for k in ("id","locationId","expiry","sha256","md5"):
+              print(f'{k}="{d.get(k,"")}"')
+          PY
+          )
+          eval "$PARSED"
+
+          LOCAL_SHA=$(sha256sum "$FILE" | awk '{print $1}')
+          [[ "$LOCAL_SHA" == "$sha256" ]] && echo "Integrity OK" || echo "::warning::sha256 mismatch"
+
+          SHARE_LINK=""
+          for U in \
+            "https://fuckingfast.co/$id" \
+            "https://fuckingfast.net/$id" \
+            "https://fuckingfast.co/d/$id" \
+            "https://fuckingfast.net/d/$id" \
+            "https://fuckingfast.co/$id/$locationId" \
+            "https://fuckingfast.net/$id/$locationId"; do
+            C=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -L -r 0-0 "$U" || echo "000")
+            echo "  [$C] $U"
+            if [[ "$C" == "200" || "$C" == "206" ]]; then SHARE_LINK="$U"; break; fi
+          done
+          [[ -z "$SHARE_LINK" ]] && SHARE_LINK="https://fuckingfast.co/$id"
+
+          echo "SHARE_LINK=$SHARE_LINK"
+          echo "EXPIRY=$expiry"
+          {
+            echo "share_link=$SHARE_LINK"
+            echo "share_id=$id"
+            echo "expiry=$expiry"
+            echo "size=$(stat -c %s "$FILE")"
+            echo "mode=$MODE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Notify Telegram
+        if: always()
+        env:
+          JOB_TOKEN: ${{ inputs.callback_job_token }}
+          CALLBACK_URL: ${{ secrets.TELEGRAM_CALLBACK_URL }}
+          CALLBACK_SECRET: ${{ secrets.TELEGRAM_CALLBACK_SECRET }}
+          LINK: ${{ steps.upload.outputs.share_link }}
+          ID: ${{ steps.upload.outputs.share_id }}
+          EXPIRY: ${{ steps.upload.outputs.expiry }}
+          SIZE: ${{ steps.upload.outputs.size }}
+          MODE: ${{ steps.upload.outputs.mode }}
+          STATUS: ${{ job.status }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${CALLBACK_URL:-}" || -z "${JOB_TOKEN:-}" ]]; then
+            echo "No callback configured — skipping"; exit 0
+          fi
+          BODY=$(python3 - <<PY
+          import json,os
+          print(json.dumps({
+            "job_token": os.environ["JOB_TOKEN"],
+            "status": "success" if os.environ["STATUS"] == "success" else "failure",
+            "link": os.environ.get("LINK",""),
+            "id": os.environ.get("ID",""),
+            "expiry": os.environ.get("EXPIRY",""),
+            "size": int(os.environ.get("SIZE","0") or 0),
+            "mode": os.environ.get("MODE",""),
+          }))
+          PY
+          )
+          curl -sS -X POST "$CALLBACK_URL" \
+            -H "Authorization: Bearer $CALLBACK_SECRET" \
+            -H "Content-Type: application/json" \
+            -d "$BODY" -w '\ncallback HTTP %{http_code}\n'
