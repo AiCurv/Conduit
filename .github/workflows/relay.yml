@@ -45,13 +45,21 @@ jobs:
         env:
           FF_ACCOUNT_ID: ${{ secrets.FF_ACCOUNT_ID }}
           MODE: ${{ inputs.upload_mode }}
-          NAME: ${{ inputs.output_filename }}
+          ORIG_NAME: ${{ inputs.output_filename }}
         shell: bash
         run: |
           set -euo pipefail
           FILE="$RUNNER_TEMP/relay-output.bin"
           RESPONSE="$RUNNER_TEMP/upload-response.json"
-          ENCODED_NAME=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$NAME")
+
+          # --- AUTO-GENERATE UNIQUE FILENAME ---
+          TIMESTAMP=$(date -u +'%Y%m%d-%H%M%S')
+          EXT="${ORIG_NAME##*.}"
+          if [[ "$EXT" == "$ORIG_NAME" || -z "$EXT" ]]; then EXT="mkv"; fi
+          UNIQUE_NAME="relay-${TIMESTAMP}.${EXT}"
+          
+          ENCODED_NAME=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$UNIQUE_NAME")
+          echo "Unique Filename: $UNIQUE_NAME"
 
           if [[ "$MODE" == "account" && -z "${FF_ACCOUNT_ID:-}" ]]; then
             echo "::warning::FF_ACCOUNT_ID missing — falling back to anonymous"
@@ -108,12 +116,8 @@ jobs:
           LOCAL_SHA=$(sha256sum "$FILE" | awk '{print $1}')
           [[ "$LOCAL_SHA" == "$sha256" ]] && echo "Integrity OK" || echo "::warning::sha256 mismatch"
 
-          # USE THE CORRECT DOMAIN (.net) WITHOUT PROBING TO AVOID CLOUDFLARE 403s
-          if [[ "$MODE" == "account" ]]; then
-            SHARE_LINK="https://fuckingfast.net/$id"
-          else
-            SHARE_LINK="https://fuckingfast.net/$id"
-          fi
+          # Hardcode the .net domain to fix the File Not Found error
+          SHARE_LINK="https://fuckingfast.net/$id"
 
           echo "SHARE_LINK=$SHARE_LINK"
           echo "EXPIRY=$expiry"
