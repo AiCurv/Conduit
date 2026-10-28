@@ -108,19 +108,12 @@ jobs:
           LOCAL_SHA=$(sha256sum "$FILE" | awk '{print $1}')
           [[ "$LOCAL_SHA" == "$sha256" ]] && echo "Integrity OK" || echo "::warning::sha256 mismatch"
 
-          SHARE_LINK=""
-          for U in \
-            "https://fuckingfast.co/$id" \
-            "https://fuckingfast.net/$id" \
-            "https://fuckingfast.co/d/$id" \
-            "https://fuckingfast.net/d/$id" \
-            "https://fuckingfast.co/$id/$locationId" \
-            "https://fuckingfast.net/$id/$locationId"; do
-            C=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -L -r 0-0 "$U" || echo "000")
-            echo "  [$C] $U"
-            if [[ "$C" == "200" || "$C" == "206" ]]; then SHARE_LINK="$U"; break; fi
-          done
-          [[ -z "$SHARE_LINK" ]] && SHARE_LINK="https://fuckingfast.co/$id"
+          # USE THE CORRECT DOMAIN (.net) WITHOUT PROBING TO AVOID CLOUDFLARE 403s
+          if [[ "$MODE" == "account" ]]; then
+            SHARE_LINK="https://fuckingfast.net/$id"
+          else
+            SHARE_LINK="https://fuckingfast.net/$id"
+          fi
 
           echo "SHARE_LINK=$SHARE_LINK"
           echo "EXPIRY=$expiry"
